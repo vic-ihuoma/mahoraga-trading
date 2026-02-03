@@ -205,6 +205,7 @@ export function Sparkline({
   data,
   width = 80,
   height = 24,
+  variant,
 }: SparklineProps) {
   if (data.length < 2) return null
 
@@ -223,13 +224,14 @@ export function Sparkline({
 
   const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(' ')
   const isPositive = data[data.length - 1] >= data[0]
+  const colors = (variant && variantColors[variant]) || (isPositive ? variantColors.green : variantColors.red)
 
   return (
     <svg width={width} height={height}>
       <path
         d={pathD}
         fill="none"
-        stroke={isPositive ? variantColors.green.stroke : variantColors.red.stroke}
+        stroke={colors.stroke}
         strokeWidth={1}
         strokeLinecap="round"
         strokeLinejoin="round"

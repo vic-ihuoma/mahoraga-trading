@@ -24,10 +24,28 @@ function isAuthorized(request: Request, env: Env): boolean {
   return constantTimeCompare(authHeader.slice(7), token);
 }
 
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+function corsResponse(response: Response): Response {
+  const newHeaders = new Headers(response.headers);
+  Object.entries(CORS_HEADERS).forEach(([key, value]) => {
+    newHeaders.set(key, value);
+  });
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newHeaders,
+  });
+}
+
 function unauthorizedResponse(): Response {
   return new Response(
     JSON.stringify({ error: "Unauthorized. Requires: Authorization: Bearer <MAHORAGA_API_TOKEN>" }),
-    { status: 401, headers: { "Content-Type": "application/json" } }
+    { status: 401, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
   );
 }
 
@@ -38,6 +56,11 @@ export default {
     ctx: ExecutionContext
   ): Promise<Response> {
     const url = new URL(request.url);
+
+    // Handle CORS preflight requests
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
 
     if (url.pathname === "/health") {
       return new Response(
@@ -82,11 +105,12 @@ export default {
       const agentPath = url.pathname.replace("/agent", "") || "/status";
       const agentUrl = new URL(agentPath, "http://harness");
       agentUrl.search = url.search;
-      return stub.fetch(new Request(agentUrl.toString(), {
+      const response = await stub.fetch(new Request(agentUrl.toString(), {
         method: request.method,
         headers: request.headers,
         body: request.body,
       }));
+      return corsResponse(response);
     }
 
     return new Response("Not found", { status: 404 });

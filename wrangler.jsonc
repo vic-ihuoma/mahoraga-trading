@@ -23,7 +23,7 @@
 	// - ALPACA_API_SECRET
 	// - MAHORAGA_API_TOKEN (API authentication - generate with: openssl rand -base64 48)
 	// - KILL_SWITCH_SECRET (emergency kill switch + approval token signing)
-	// 
+	//
 	// LLM Provider (choose one mode):
 	// - LLM_PROVIDER ("openai-raw" | "ai-sdk" | "vercel-gateway", default: "openai-raw")
 	// - LLM_MODEL (model identifier, e.g. "gpt-4o-mini" or "anthropic/claude-sonnet-4")
@@ -44,14 +44,14 @@
 		{
 			"binding": "DB",
 			"database_name": "mahoraga-db",
-			"database_id": "c5360d02-1890-45b8-bcb1-ac753cc34ae7",
+			"database_id": "66f54978-49a6-4245-bf5b-65f0d949ca45",
 			"migrations_dir": "migrations"
 		}
 	],
 	"kv_namespaces": [
 		{
 			"binding": "CACHE",
-			"id": "11f44d9c731d47959e0058dce695aa4f"
+			"id": "fd777ced78854e1d9bd99dc86e9feed7"
 		}
 	],
 	"r2_buckets": [

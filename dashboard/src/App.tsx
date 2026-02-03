@@ -11,7 +11,13 @@ import { NotificationBell } from './components/NotificationBell'
 import { Tooltip, TooltipContent } from './components/Tooltip'
 import type { Status, Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
 
-const API_BASE = '/api'
+function getApiBase(): string {
+  // Check localStorage first, then default to worker URL
+  return localStorage.getItem('mahoraga_api_base') ||
+    'https://mahoraga.622hmwgngv.workers.dev/agent'
+}
+
+const API_BASE = getApiBase()
 
 function getApiToken(): string {
   return localStorage.getItem('mahoraga_api_token') || (window as unknown as { VITE_MAHORAGA_API_TOKEN?: string }).VITE_MAHORAGA_API_TOKEN || ''
