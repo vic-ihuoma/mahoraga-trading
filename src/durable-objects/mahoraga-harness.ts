@@ -80,6 +80,7 @@ interface AgentConfig {
   llm_model: string;               // [TUNE] Model for quick research (gpt-4o-mini)
   llm_analyst_model: string;       // [TUNE] Model for deep analysis (gpt-4o)
   llm_max_tokens: number;
+  llm_min_hold_minutes: number;    // [TUNE] Min minutes before LLM can recommend sell (default: 30)
 
   // Options trading - trade options instead of shares for high-conviction plays
   options_enabled: boolean;        // [TOGGLE] Enable/disable options trading
@@ -105,6 +106,9 @@ interface AgentConfig {
 
   // Custom ticker blacklist - user-defined symbols to never trade (e.g., insider trading restrictions)
   ticker_blacklist: string[];
+
+  // Allowed exchanges - only trade stocks listed on these exchanges (avoids OTC data issues)
+  allowed_exchanges: string[];
 }
 
 // [CUSTOMIZABLE] Add fields here when you add new data sources
@@ -279,6 +283,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   llm_model: "gpt-4o-mini",
   llm_analyst_model: "gpt-4o",
   llm_max_tokens: 500,
+  llm_min_hold_minutes: 30,
   options_enabled: false,
   options_min_confidence: 0.8,
   options_max_pct_per_trade: 0.02,
@@ -298,6 +303,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   crypto_take_profit_pct: 10,
   crypto_stop_loss_pct: 5,
   ticker_blacklist: [],
+  allowed_exchanges: ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"],
 };
 
 const DEFAULT_STATE: AgentState = {
@@ -339,7 +345,78 @@ const TICKER_BLACKLIST = new Set([
   "SO", "TO", "UP", "US", "WE", "AN", "AM", "AH", "OH", "OK", "HI", "YA", "YO",
   // More trading slang
   "BULL", "BEAR", "CALL", "PUTS", "HOLD", "SELL", "MOON", "PUMP", "DUMP", "BAGS", "TEND",
+  // Additional common words that appear as false positives
+  "START", "ABOUT", "NAME", "NEXT", "PLAY", "LIVE", "GAME", "BEST", "LINK", "READ",
+  "POST", "NEWS", "FREE", "LOOK", "HELP", "OPEN", "FULL", "VIEW", "REAL", "SEND",
+  "HIGH", "DROP", "FAST", "SAFE", "RISK", "TURN", "PLAN", "DEAL", "MOVE", "HUGE",
+  "EASY", "HARD", "LATE", "WAIT", "SOON", "STOP", "EXIT", "GAIN", "LOSS", "GROW",
+  "FALL", "JUMP", "KEEP", "COPY", "EDIT", "SAVE", "NOTE", "TIPS", "IDEA", "PLUS",
+  "ZERO", "SELF", "BOTH", "BETA", "TEST", "INFO", "DATA", "CASH", "WHAT", "WHEN",
+  "WHERE", "WHY", "WATCH", "LOVE", "HATE", "TECH", "HOPE", "FEAR", "WEEK", "LAST",
+  "PART", "SIDE", "STEP", "SURE", "TELL", "THINK", "TOLD", "TRUE", "TURN", "TYPE",
+  "UNIT", "USED", "VERY", "WANT", "WENT", "WERE", "YEAH", "YOUR", "ELSE", "AWAY",
+  "OTHER", "PRICE", "THEIR", "STILL", "CHEAP", "THESE", "LEAP", "EVERY", "SINCE",
+  "BEING", "THOSE", "DOING", "COULD", "WOULD", "SHOULD", "MIGHT", "MUST", "SHALL",
 ]);
+
+class ValidTickerCache {
+  private secTickers: Set<string> | null = null;
+  private lastSecRefresh = 0;
+  private alpacaCache: Map<string, boolean> = new Map();
+  private readonly SEC_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+  async refreshSecTickersIfNeeded(): Promise<void> {
+    if (this.secTickers && Date.now() - this.lastSecRefresh < this.SEC_REFRESH_INTERVAL_MS) {
+      return;
+    }
+    try {
+      const res = await fetch("https://www.sec.gov/files/company_tickers.json", {
+        headers: { "User-Agent": "Mahoraga Trading Bot" },
+      });
+      if (!res.ok) return;
+      const data = await res.json() as Record<string, { cik_str: number; ticker: string; title: string }>;
+      this.secTickers = new Set(
+        Object.values(data).map((e) => e.ticker.toUpperCase())
+      );
+      this.lastSecRefresh = Date.now();
+    } catch {
+      // Keep existing cache on failure
+    }
+  }
+
+  isKnownSecTicker(symbol: string): boolean {
+    return this.secTickers?.has(symbol.toUpperCase()) ?? false;
+  }
+
+  getCachedValidation(symbol: string): boolean | undefined {
+    return this.alpacaCache.get(symbol.toUpperCase());
+  }
+
+  setCachedValidation(symbol: string, isValid: boolean): void {
+    this.alpacaCache.set(symbol.toUpperCase(), isValid);
+  }
+
+  async validateWithAlpaca(
+    symbol: string,
+    alpaca: { trading: { getAsset(s: string): Promise<{ tradable: boolean } | null> } }
+  ): Promise<boolean> {
+    const upper = symbol.toUpperCase();
+    const cached = this.alpacaCache.get(upper);
+    if (cached !== undefined) return cached;
+
+    try {
+      const asset = await alpaca.trading.getAsset(upper);
+      const isValid = asset !== null && asset.tradable;
+      this.alpacaCache.set(upper, isValid);
+      return isValid;
+    } catch {
+      this.alpacaCache.set(upper, false);
+      return false;
+    }
+  }
+}
+
+const tickerCache = new ValidTickerCache();
 
 // ============================================================================
 // SECTION 2: HELPER FUNCTIONS
@@ -814,6 +891,8 @@ export class MahoragaHarness extends DurableObject<Env> {
   private async runDataGatherers(): Promise<void> {
     this.log("System", "gathering_data", {});
 
+    await tickerCache.refreshSecTickersIfNeeded();
+
     const [stocktwitsSignals, redditSignals, cryptoSignals] = await Promise.all([
       this.gatherStockTwits(),
       this.gatherReddit(),
@@ -845,22 +924,47 @@ export class MahoragaHarness extends DurableObject<Env> {
     const signals: Signal[] = [];
     const sourceWeight = SOURCE_CONFIG.weights.stocktwits;
 
+    const stocktwitsHeaders = {
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "application/json",
+      "Accept-Language": "en-US,en;q=0.9",
+    };
+
+    const fetchWithRetry = async (url: string, maxRetries = 3): Promise<Response | null> => {
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          const res = await fetch(url, { headers: stocktwitsHeaders });
+          if (res.ok) return res;
+          if (res.status === 403) {
+            await this.sleep(1000 * Math.pow(2, i));
+            continue;
+          }
+          return null;
+        } catch {
+          await this.sleep(1000 * Math.pow(2, i));
+        }
+      }
+      return null;
+    };
+
     try {
-      // Get trending symbols
-      const trendingRes = await fetch("https://api.stocktwits.com/api/2/trending/symbols.json");
-      if (!trendingRes.ok) return [];
+      const trendingRes = await fetchWithRetry("https://api.stocktwits.com/api/2/trending/symbols.json");
+      if (!trendingRes) {
+        this.log("StockTwits", "cloudflare_blocked", { 
+          message: "StockTwits API blocked by Cloudflare - using Reddit only" 
+        });
+        return [];
+      }
       const trendingData = await trendingRes.json() as { symbols?: Array<{ symbol: string }> };
       const trending = trendingData.symbols || [];
 
-      // Get sentiment for top trending
       for (const sym of trending.slice(0, 15)) {
         try {
-          const streamRes = await fetch(`https://api.stocktwits.com/api/2/streams/symbol/${sym.symbol}.json?limit=30`);
-          if (!streamRes.ok) continue;
+          const streamRes = await fetchWithRetry(`https://api.stocktwits.com/api/2/streams/symbol/${sym.symbol}.json?limit=30`);
+          if (!streamRes) continue;
           const streamData = await streamRes.json() as { messages?: Array<{ entities?: { sentiment?: { basic?: string } }; created_at?: string }> };
           const messages = streamData.messages || [];
 
-          // Analyze sentiment
           let bullish = 0, bearish = 0, totalTimeDecay = 0;
           for (const msg of messages) {
             const sentiment = msg.entities?.sentiment?.basic;
@@ -986,8 +1090,22 @@ export class MahoragaHarness extends DurableObject<Env> {
     }
 
     const signals: Signal[] = [];
+    const alpaca = createAlpacaProviders(this.env);
+
     for (const [symbol, data] of tickerData) {
       if (data.mentions >= 2) {
+        if (!tickerCache.isKnownSecTicker(symbol)) {
+          const cached = tickerCache.getCachedValidation(symbol);
+          if (cached === false) continue;
+          if (cached === undefined) {
+            const isValid = await tickerCache.validateWithAlpaca(symbol, alpaca);
+            if (!isValid) {
+              this.log("Reddit", "invalid_ticker_filtered", { symbol });
+              continue;
+            }
+          }
+        }
+
         const avgRawSentiment = data.rawSentiment / data.mentions;
         const avgQuality = data.totalQuality / data.mentions;
         const finalSentiment = data.totalQuality > 0
@@ -1533,10 +1651,10 @@ JSON response:
       if (isCrypto) {
         const normalized = normalizeCryptoSymbol(symbol);
         const snapshot = await alpaca.marketData.getCryptoSnapshot(normalized).catch(() => null);
-        price = snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || snapshot?.latest_trade?.price || 0;
+        price = snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
       } else {
-        const quote = await alpaca.marketData.getQuote(symbol).catch(() => null);
-        price = quote?.ask_price || quote?.bid_price || 0;
+        const snapshot = await alpaca.marketData.getSnapshot(symbol).catch(() => null);
+        price = snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
       }
 
       const prompt = `Should we BUY this ${isCrypto ? "crypto" : "stock"} based on social sentiment and fundamentals?
@@ -1788,9 +1906,12 @@ ACCOUNT STATUS:
 - Current Positions: ${positions.length}/${this.state.config.max_positions}
 
 CURRENT POSITIONS:
-${positions.length === 0 ? "None" : positions.map(p =>
-      `- ${p.symbol}: ${p.qty} shares, P&L: $${p.unrealized_pl.toFixed(2)} (${((p.unrealized_pl / (p.market_value - p.unrealized_pl)) * 100).toFixed(1)}%)`
-    ).join("\n")}
+${positions.length === 0 ? "None" : positions.map(p => {
+      const entry = this.state.positionEntries[p.symbol];
+      const holdMinutes = entry ? Math.round((Date.now() - entry.entry_time) / (1000 * 60)) : 0;
+      const holdStr = holdMinutes >= 60 ? `${(holdMinutes / 60).toFixed(1)}h` : `${holdMinutes}m`;
+      return `- ${p.symbol}: ${p.qty} shares, P&L: $${p.unrealized_pl.toFixed(2)} (${((p.unrealized_pl / (p.market_value - p.unrealized_pl)) * 100).toFixed(1)}%), held ${holdStr}`;
+    }).join("\n")}
 
 TOP SENTIMENT CANDIDATES:
 ${candidates.map(c =>
@@ -1807,6 +1928,7 @@ TRADING RULES:
 - Take profit target: ${this.state.config.take_profit_pct}%
 - Stop loss: ${this.state.config.stop_loss_pct}%
 - Min confidence to trade: ${this.state.config.min_analyst_confidence}
+- Min hold time before selling: ${this.state.config.llm_min_hold_minutes ?? 30} minutes
 
 Analyze and provide BUY/SELL/HOLD recommendations:`;
 
@@ -1820,7 +1942,9 @@ Analyze and provide BUY/SELL/HOLD recommendations:`;
 
 Rules:
 - Only recommend BUY for symbols with strong conviction from multiple data points
-- Recommend SELL for positions with deteriorating sentiment or hitting targets
+- Recommend SELL only for positions that have been held long enough AND show deteriorating sentiment or major red flags
+- Give positions time to develop - avoid selling too early just because gains are small
+- Positions held less than 1-2 hours should generally be given more time unless hitting stop loss
 - Consider the QUALITY of sentiment, not just quantity
 - Output valid JSON only
 
@@ -1988,13 +2112,37 @@ Response format:
         }
       }
 
-      if (positions.length < this.state.config.max_positions) {
-        const analysis = await this.analyzeSignalsWithLLM(this.state.signalCache, positions, account);
-        const researchedSymbols = new Set(researchedBuys.map(r => r.symbol));
+      const analysis = await this.analyzeSignalsWithLLM(this.state.signalCache, positions, account);
+      const researchedSymbols = new Set(researchedBuys.map(r => r.symbol));
 
-        for (const rec of analysis.recommendations) {
-          if (positions.length >= this.state.config.max_positions) break;
-          if (rec.action !== "BUY" || rec.confidence < this.state.config.min_analyst_confidence) continue;
+      for (const rec of analysis.recommendations) {
+        if (rec.confidence < this.state.config.min_analyst_confidence) continue;
+
+        if (rec.action === "SELL" && heldSymbols.has(rec.symbol)) {
+          const entry = this.state.positionEntries[rec.symbol];
+          const holdMinutes = entry ? (Date.now() - entry.entry_time) / (1000 * 60) : 0;
+          const minHoldMinutes = this.state.config.llm_min_hold_minutes ?? 30;
+          
+          if (holdMinutes < minHoldMinutes) {
+            this.log("Analyst", "llm_sell_blocked", { 
+              symbol: rec.symbol, 
+              holdMinutes: Math.round(holdMinutes),
+              minRequired: minHoldMinutes,
+              reason: "Position held less than minimum hold time"
+            });
+            continue;
+          }
+          
+          const result = await this.executeSell(alpaca, rec.symbol, `LLM recommendation: ${rec.reasoning}`);
+          if (result) {
+            heldSymbols.delete(rec.symbol);
+            this.log("Analyst", "llm_sell_executed", { symbol: rec.symbol, confidence: rec.confidence, reasoning: rec.reasoning });
+          }
+          continue;
+        }
+
+        if (rec.action === "BUY") {
+          if (positions.length >= this.state.config.max_positions) continue;
           if (heldSymbols.has(rec.symbol)) continue;
           if (researchedSymbols.has(rec.symbol)) continue;
 
@@ -2025,6 +2173,21 @@ Response format:
     confidence: number,
     account: Account
   ): Promise<boolean> {
+    if (!symbol || symbol.trim().length === 0) {
+      this.log("Executor", "buy_blocked", { reason: "INVARIANT: Empty symbol" });
+      return false;
+    }
+
+    if (account.cash <= 0) {
+      this.log("Executor", "buy_blocked", { symbol, reason: "INVARIANT: No cash available", cash: account.cash });
+      return false;
+    }
+
+    if (confidence <= 0 || confidence > 1 || !Number.isFinite(confidence)) {
+      this.log("Executor", "buy_blocked", { symbol, reason: "INVARIANT: Invalid confidence", confidence });
+      return false;
+    }
+
     const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
     const positionSize = Math.min(
       account.cash * (sizePct / 100) * confidence,
@@ -2036,10 +2199,41 @@ Response format:
       return false;
     }
 
+    const maxAllowed = this.state.config.max_position_value * 1.01;
+    if (positionSize <= 0 || positionSize > maxAllowed || !Number.isFinite(positionSize)) {
+      this.log("Executor", "buy_blocked", {
+        symbol,
+        reason: "INVARIANT: Invalid position size",
+        positionSize,
+        maxAllowed,
+      });
+      return false;
+    }
+
     try {
       const isCrypto = isCryptoSymbol(symbol, this.state.config.crypto_symbols || []);
       const orderSymbol = isCrypto ? normalizeCryptoSymbol(symbol) : symbol;
       const timeInForce = isCrypto ? "gtc" : "day";
+
+      if (!isCrypto) {
+        const allowedExchanges = this.state.config.allowed_exchanges ?? ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"];
+        if (allowedExchanges.length > 0) {
+          const asset = await alpaca.trading.getAsset(symbol);
+          if (!asset) {
+            this.log("Executor", "buy_blocked", { symbol, reason: "Asset not found" });
+            return false;
+          }
+          if (!allowedExchanges.includes(asset.exchange)) {
+            this.log("Executor", "buy_blocked", { 
+              symbol, 
+              reason: "Exchange not allowed (OTC/foreign stocks have data issues)",
+              exchange: asset.exchange,
+              allowedExchanges 
+            });
+            return false;
+          }
+        }
+      }
 
       const order = await alpaca.trading.createOrder({
         symbol: orderSymbol,
@@ -2062,11 +2256,20 @@ Response format:
     symbol: string,
     reason: string
   ): Promise<boolean> {
+    if (!symbol || symbol.trim().length === 0) {
+      this.log("Executor", "sell_blocked", { reason: "INVARIANT: Empty symbol" });
+      return false;
+    }
+
+    if (!reason || reason.trim().length === 0) {
+      this.log("Executor", "sell_blocked", { symbol, reason: "INVARIANT: No sell reason provided" });
+      return false;
+    }
+
     try {
       await alpaca.trading.closePosition(symbol);
       this.log("Executor", "sell_executed", { symbol, reason });
 
-      // Clean up tracking
       delete this.state.positionEntries[symbol];
       delete this.state.socialHistory[symbol];
       delete this.state.stalenessAnalysis[symbol];
@@ -2221,8 +2424,8 @@ Response format:
         return null;
       }
 
-      const quote = await alpaca.marketData.getQuote(symbol);
-      const stockPrice = quote?.ask_price || quote?.bid_price || 0;
+      const snapshot = await alpaca.marketData.getSnapshot(symbol).catch(() => null);
+      const stockPrice = snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
       if (stockPrice === 0) return null;
 
       const targetStrike = direction === "bullish"
